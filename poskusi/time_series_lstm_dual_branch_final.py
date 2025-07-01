@@ -1,0 +1,689 @@
+# basic libraries
+import pandas as pd
+import numpy as np
+import random
+
+
+# sklearn
+from sklearn.model_selection import train_test_split
+from sklearn.linear_model import LinearRegression
+from sklearn.multioutput import MultiOutputRegressor
+from sklearn.metrics import mean_absolute_error
+from sklearn.metrics import mean_squared_error
+from sklearn.preprocessing import StandardScaler
+
+# torch
+import torch
+import torch.nn as nn
+from torch.utils.data import DataLoader, TensorDataset, Dataset
+from torch import cat
+
+# additional information about holidays
+import sys
+import os
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
+from podatki.holidays import add_holiday_features
+
+
+def set_seed(seed=42):
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)  # if you use multi-GPU
+    np.random.seed(seed)
+    random.seed(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False  # Slower, but deterministic
+
+set_seed(42)
+
+
+
+class PrepareAttributres():
+    
+    def __init__(self, filename):
+        
+        # store variables
+        self.filename = filename
+
+        # other variables
+        self.processed_data = None
+        self.attributes = []
+    
+    def load_and_process(self):
+        """Prepares attributes for all timestamps, then use whatever u need"""
+
+        print("***\nLoading and processing attributes started")
+
+        data = pd.read_csv(self.filename)
+        
+        # add holidays
+        data = add_holiday_features(data)
+
+        # remove stations:
+        data = data[['timestamp', 'is_holiday', 'is_school_holiday']]
+
+        # add one-hot hour, month and day in week
+        data['hour'] = data['timestamp'].dt.hour
+        data['month'] = data['timestamp'].dt.month
+        data['day_of_week'] = data['timestamp'].dt.dayofweek
+
+        hour_ohe = pd.get_dummies(data['hour'], prefix='hour').astype(int)
+        month_ohe = pd.get_dummies(data['month'], prefix='month').astype(int)
+        day_of_week_ohe = pd.get_dummies(data['day_of_week'], prefix='day_of_week').astype(int)
+
+        # Ensure full one-hot coverage
+        for i in range(24):
+            col = f"hour_{i}"
+            if col not in hour_ohe.columns:
+                hour_ohe[col] = 0
+
+        for i in range(1, 13):
+            col = f"month_{i}"
+            if col not in month_ohe.columns:
+                month_ohe[col] = 0
+
+        for i in range(7):
+            col = f"day_of_week_{i}"
+            if col not in day_of_week_ohe.columns:
+                day_of_week_ohe[col] = 0
+
+        # Align column order (very important!)
+        hour_ohe = hour_ohe[[f"hour_{i}" for i in range(24)]]
+        month_ohe = month_ohe[[f"month_{i}" for i in range(1, 13)]]
+        day_of_week_ohe = day_of_week_ohe[[f"day_of_week_{i}" for i in range(7)]]
+
+        data = pd.concat([data.drop(columns=['hour', 'month', 'day_of_week']), hour_ohe, month_ohe, day_of_week_ohe], axis=1)
+
+        #print(data)
+
+        attributes = list(hour_ohe.columns) + list(month_ohe.columns) + list(day_of_week_ohe) + ['is_holiday', 'is_school_holiday']
+        #print(f"ADDITIONAL ATTRIBUTES:\n{attributes}")
+
+
+        # revert time to original + store variables
+        data['timestamp'] = data['timestamp'].dt.strftime('%Y-%m-%dT%H:%MZ')
+        self.processed_data = data 
+        self.attributes = attributes
+
+        print(f"Loading and processing attributes finished.\n***")
+
+
+class PrepareTimeSeries:
+
+    def __init__(self, filename, train_size=48, predict_size=4, gap_size=26):
+
+        #print("***\nInitialization of PrepareData started")
+
+        # store the variables
+        self.filename = filename
+        self.train_size = train_size
+        self.predict_size = predict_size
+        self.gap_size = gap_size
+        
+        # variables created in this class
+        self.data = None
+        self.X = None 
+        self.y = None 
+
+
+        #print("Successfully initialized class PrepareData")
+
+    def load_and_process(self):
+        """Load data, drop nan values, add atributes. Divide data to <train_size> and <predict_size>, drop <gap_size>."""
+
+        #print("***\nLoading and processing data started")
+
+        # read the data
+        data = pd.read_csv(self.filename)
+
+        # drop the nan rows if theres any
+        data = data.dropna(axis=0, how='any', ignore_index=True)
+
+        # save data
+        self.data = data
+
+        # we need to split data into X series and y series, dropping gap size after them
+        X_list = []
+        y_list = []
+
+        total_window = self.train_size + self.predict_size + self.gap_size
+        max_index = len(self.data) - total_window
+
+        step_size = self.train_size + self.predict_size + self.gap_size - 1
+        for idx in range(0, max_index, step_size):
+            
+            #  0 : 47, skip 62, 113:160, skip 62 etc
+            X_slice = self.data.iloc[idx : (idx + self.train_size)]
+            # 47 : 51, skip 62, 161:164, skip 62 etc
+            y_slice = self.data.iloc[(idx + self.train_size) : (idx + self.train_size + self.predict_size)]
+
+            #print(f"FIRST 48 HOURS:\n{X_slice}")
+            #print(f"NEXT 4 HOURS WE'RE PREDICTING:\n{y_slice}")
+
+            X_list.append(X_slice)
+            y_list.append(y_slice)
+
+        
+        X = pd.concat(X_list, ignore_index=True)
+        y = pd.concat(y_list, ignore_index=True)
+
+        #print(f"X shape: {X.shape}, y shape: {y.shape}")
+        #print(f"X values\n{X}")
+        #print(f"y values\n{y}")
+
+        self.X = X 
+        self.y = y
+
+        #print(f"Loading and processing data finished.")
+
+
+class PrepareData():
+
+    def __init__(self, attributes, time_series, train_size=48, predict_size=4, gap_size=26):
+
+        self.attributes = attributes
+        self.time_series = time_series
+
+        self.train_size = train_size
+        self.predict_size = predict_size
+        self.gap_size = gap_size
+
+
+        # train test
+        self.X_train_timeseries = None
+        self.X_train_attributes = None
+        self.X_val_timeseries = None
+        self.X_val_attributes = None
+        self.y_train = None
+        self.y_val = None
+
+        # standard scaler
+        self.scaler = None
+        self.scaler_mean = None 
+        self.scaler_std = None 
+
+        self.X_train_standardize = None
+        self.X_val_standardize = None
+        self.y_train_standardize = None
+        self.y_val_standardize = None
+
+        # tensors
+        self.X_train_timeseries_tensor = None
+        self.X_val_timeseries_tensor = None
+        self.X_train_attributes_tensor = None
+        self.X_val_attributes_tensor = None
+        self.y_train_tensor = None
+        self.y_val_tensor = None
+
+
+    def adjust_attributes(self):
+        """keep only rows in attributes whose timestamp appears in time_series"""
+        
+        # Keep only rows with matching timestamps
+        matched_attributes = self.attributes[
+            self.attributes["timestamp"].isin(self.time_series["timestamp"])
+        ].reset_index(drop=True)
+
+        self.attributes = matched_attributes
+
+    def create_train_test(self, y):
+        """create train and val sets"""
+
+        #print("***\nCreating train and test sets started")
+
+        # the percentage division needs to be exactly at 48k and 4k 
+        training_ratio = 0.80
+        split_train_samples = int(len(self.time_series) * training_ratio)
+        split_predict_samples = int(len(y) * training_ratio)
+
+        # separate by index
+        X_train_timeseries = self.time_series.iloc[:split_train_samples].copy()
+        X_train_attributes = self.attributes.iloc[:split_train_samples].copy()
+
+        X_test_timeseries = self.time_series.iloc[split_train_samples:].copy()
+        X_test_attributes = self.attributes.iloc[split_train_samples:].copy()
+
+        y_train = y.iloc[:split_predict_samples].copy()
+        y_test = y.iloc[split_predict_samples:].copy()
+        #print(f"X_train_timeseries shape: {X_train_timeseries.shape}, X_test_timeseries shape: {X_test_timeseries.shape}")
+        #print(f"X_train_attributes shape: {X_train_attributes.shape}, X_test_attributes shape: {X_test_attributes.shape}")
+        #print(f"y_train shape: {y_train.shape}, y_test shape: {y_test.shape}")
+
+        #print(f"X: {len(X_train)} + {len(X_test)} = {len(X_train) + len(X_test)}, must be equal to {len(self.X)}")
+        #print(f"y: {len(y_train)} + {len(y_test)} = {len(y_train) + len(y_test)}, must be equal to {len(self.y)}")
+
+        #print(f"X train TIME SERIES\n{X_train_timeseries}")
+        #print(f"y train TIME SERIES\n{y_train}")
+
+        #print(f"X train ATTRIBUTES\n{X_train_attributes}")
+        #print(f"y train ATTRIBUTES\n{y_train}")
+
+        #print(f"X test TIME SERIES\n{X_test_timeseries}")
+        #print(f"y test\n{y_test}")
+
+        #print(f"X test ATTRIBUTES\n{X_test_attributes}")
+        #print(f"y test\n{y_test}")
+
+        # and finally, store!
+        self.X_train_timeseries = X_train_timeseries
+        self.X_train_attributes = X_train_attributes
+        self.X_val_timeseries = X_test_timeseries
+        self.X_val_attributes = X_test_attributes
+        self.y_train = y_train
+        self.y_val = y_test
+
+        #print("Creating train and test sets finished")
+
+    def standardize_data(self, station_name):
+        """panda to numpy + standardize"""
+
+        #print("***\nData standardization started")
+
+        # only need to standardize time series
+        self.X_train_standardize = self.X_train_timeseries[[station_name]].values
+        self.X_val_standardize = self.X_val_timeseries[[station_name]].values
+
+        # standardize
+        self.scaler = StandardScaler()
+        self.scaler.fit(self.X_train_standardize)
+        self.scaler_mean = self.scaler.mean_[0] 
+        self.scaler_std = self.scaler.scale_[0] 
+
+        self.X_train_standardize = self.scaler.transform(self.X_train_standardize)
+        self.X_val_standardize = self.scaler.transform(self.X_val_standardize)
+
+        # only store y
+        self.y_train_standardize = self.y_train[station_name].values
+        self.y_val_standardize = self.y_val[station_name].values
+
+        #print(self.X_train_standardize)
+        #print(self.X_train_standardize.shape)
+
+        #print(self.X_val_standardize)
+        #print(self.X_val_standardize.shape)
+
+        #print(self.y_train_standardize)
+        #print(self.y_train_standardize.shape)
+
+        #print(self.y_val_standardize)
+        #print(self.y_val_standardize.shape)
+
+        #print("Data standardization finished")
+
+
+    def numpy_to_tensor(self):
+        """return pytorch tensors"""
+
+        #print("***\nTransformation from numpy to pytorch tensor started")
+
+
+        # === Time Series Tensors ===
+        num_train_samples = len(self.X_train_standardize) // self.train_size
+        num_val_samples = len(self.X_val_standardize) // self.train_size
+
+        X_train_timeseries_tensor = torch.tensor(
+            self.X_train_standardize[:num_train_samples * self.train_size].reshape(num_train_samples, self.train_size, 1),
+            dtype=torch.float32
+        )
+
+        X_val_timeseries_tensor = torch.tensor(
+            self.X_val_standardize[:num_val_samples * self.train_size].reshape(num_val_samples, self.train_size, 1),
+            dtype=torch.float32
+        )
+
+        # === Attribute Tensors ===
+        # Drop timestamp and convert to numpy
+        train_attrs = self.X_train_attributes.drop(columns=["timestamp"]).values
+        val_attrs = self.X_val_attributes.drop(columns=["timestamp"]).values
+
+        X_train_attributes_tensor = torch.tensor(
+            train_attrs[:num_train_samples * self.train_size].reshape(num_train_samples, self.train_size, -1),
+            dtype=torch.float32
+        )
+
+        X_val_attributes_tensor = torch.tensor(
+            val_attrs[:num_val_samples * self.train_size].reshape(num_val_samples, self.train_size, -1),
+            dtype=torch.float32
+        )
+
+        # === Target Tensors ===
+        y_train_tensor = torch.tensor(
+            self.y_train_standardize[:num_train_samples * self.predict_size].reshape(num_train_samples, self.predict_size),
+            dtype=torch.float32
+        )
+
+        y_val_tensor = torch.tensor(
+            self.y_val_standardize[:num_val_samples * self.predict_size].reshape(num_val_samples, self.predict_size),
+            dtype=torch.float32
+        )
+
+        self.X_train_timeseries_tensor = X_train_timeseries_tensor
+        self.X_val_timeseries_tensor = X_val_timeseries_tensor
+        self.X_train_attributes_tensor = X_train_attributes_tensor
+        self.X_val_attributes_tensor = X_val_attributes_tensor
+        self.y_train_tensor = y_train_tensor
+        self.y_val_tensor = y_val_tensor
+
+
+        return (
+            X_train_timeseries_tensor,
+            X_val_timeseries_tensor,
+            X_train_attributes_tensor,
+            X_val_attributes_tensor,
+            y_train_tensor,
+            y_val_tensor
+        )
+
+        #print("Transformation from numpy to pytorch tensor finished")
+
+    def get_station_names(self):
+        """return station names from data"""
+        #station_columns = list(self.data.columns.difference(["timestamp"]))
+        #return station_columns
+        return [col for col in self.time_series.columns if col != "timestamp"]
+
+    def get_standardization_info(self):
+        """return mean and std from scaler"""
+        return self.scaler_mean, self.scaler_std
+
+    def get_scaler(self):
+        return self.scaler
+
+
+class Model_Dual_Branch(nn.Module):
+
+    def __init__(self, scaler_mean, scaler_std, attr_input_size, lr=0.01, epochs=150, weight_dec=0.0005):
+        super().__init__()
+
+        # (batch_size, sequence_length, input_size)
+        # sequence_length: How many time steps you're giving the LSTM (e.g. 48 hours).
+        # input_size: How many features you have per time step.
+        # batch_size: How many samples you’re training in parallel.
+
+        # LSTM for time series
+        self.input_size=1
+        self.hidden_size=128
+        self.num_layers=2
+        self.output_size=4
+
+        self.LSTM_model = nn.LSTM(
+            input_size=self.input_size, 
+            hidden_size=self.hidden_size, 
+            num_layers=self.num_layers, 
+            batch_first=True,
+            dropout=0.2
+        )
+
+        self.attr_input_size = attr_input_size * 48
+
+        # NN for attributes
+        self.output_size_nn = 64
+        self.NN_model = nn.Sequential(
+            nn.Linear(self.attr_input_size, 512),
+            nn.BatchNorm1d(512),
+            nn.ReLU(),
+            nn.Dropout(0.2),
+
+            nn.Linear(512, 256),
+            nn.BatchNorm1d(256),
+            nn.ReLU(),
+            nn.Dropout(0.2),
+
+            nn.Linear(256, self.output_size_nn),
+            nn.BatchNorm1d(self.output_size_nn),
+            nn.ReLU(),
+            nn.Dropout(0.2),
+        )
+
+        self.final_model = nn.Sequential(
+            nn.Linear(self.hidden_size + self.output_size_nn, 64),
+            nn.BatchNorm1d(64),
+            nn.ReLU(),
+            nn.Dropout(0.2),
+
+            nn.Linear(64, self.output_size),
+        )
+
+        # store other variables
+        self.scaler_mean = scaler_mean
+        self.scaler_std = scaler_std
+        self.lr = lr
+        self.wd = weight_dec
+        self.epochs = epochs
+
+
+    def forward(self, x_timeseries, x_attributes):
+        _, (h_n, _) = self.LSTM_model(x_timeseries)  # h_n: (num_layers, batch, hidden)
+        time_out = h_n[-1]  # (batch, hidden_size)
+
+        # Flatten attribute input
+        attr_flat = x_attributes.reshape(x_attributes.size(0), -1)  # (batch, 48 * attr_input_size)
+        attr_out = self.NN_model(attr_flat)          # (batch, 64)
+
+        # Concatenate both branches
+        combined = torch.cat((time_out, attr_out), dim=1)  # (batch, hidden + 64)
+        out = self.final_model(combined)  # (batch, output_size=4)
+        return out
+
+    
+    def fit(self, X_timeseries_tensor, X_attributes_tensor, y_tensor, batch_size=8, patience=20):
+        #print("************\nTRAINING")
+
+        # batch learning
+        dataset = TensorDataset(X_timeseries_tensor, X_attributes_tensor, y_tensor)
+        dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True, drop_last=True)
+
+        # 3. Define optimizer and loss
+        #optimizer = torch.optim.Adam(self.parameters(), lr=self.lr, weight_decay=self.wd)
+        optimizer = torch.optim.SGD(self.parameters(), lr=self.lr, weight_decay=self.wd)
+        loss_fn = nn.MSELoss()
+
+        best_loss = float('inf')
+        patience_counter = 0
+
+        # 4. Training loop
+        for epoch in range(self.epochs):
+            self.train()
+            total_loss = 0
+
+            for batch_X_time, batch_X_attr, batch_y in dataloader:
+                
+                pred = self.forward(batch_X_time, batch_X_attr)
+                loss = loss_fn(pred, batch_y)
+
+                optimizer.zero_grad()
+                loss.backward()
+                optimizer.step()
+                
+                total_loss += loss.item()
+
+            avg_loss = total_loss / len(dataloader)
+
+            if epoch % 30 == 0 or epoch == self.epochs - 1:
+                print(f"Epoch {epoch} - Avg Loss: {avg_loss:.4f} - Total Loss: {total_loss:.4f}")
+                #print(f"Epoch {epoch} - Loss: {loss.item():.4f}")
+
+
+            # Early stopping check
+            if avg_loss < best_loss - 1e-4: 
+                best_loss = avg_loss
+                patience_counter = 0
+            else:
+                patience_counter += 1
+                if patience_counter >= patience:
+                    print(f"Early stopping triggered at epoch {epoch+1}")
+                    break
+        
+
+    def predict(self, X_timeseries_tensor, X_attributes_tensor):
+ 
+        self.eval()
+        with torch.no_grad():
+            
+            preds_standard = self.forward(X_timeseries_tensor, X_attributes_tensor)
+            #preds = preds_standard * self.scaler_std + self.scaler_mean
+
+            preds = np.clip(preds_standard, a_min=0, a_max=None)
+
+            return preds
+
+def final_prediction(test_path, station, model, scaler, output_path="bicikelj_predictions_lstm.csv"):
+
+    data = pd.read_csv(test_path)
+
+    test_attribute_class = PrepareAttributres(test_path)
+    test_attribute_class.load_and_process()
+    attributes_pandas = test_attribute_class.processed_data
+    attributes_list = test_attribute_class.attributes
+    #print(attributes_list)
+
+    # get X and y
+    X_list = []
+
+    for idx in range(0, len(data), 52):
+        
+        X_slice = data.iloc[idx : (idx + 48)]
+        X_list.append(X_slice)
+
+    
+    X = pd.concat(X_list, ignore_index=True)
+
+    preparedata_class = PrepareData(attributes_pandas, X)
+    preparedata_class.adjust_attributes()
+    attributes_pandas = preparedata_class.attributes
+
+
+    X = X[[station]].values
+
+    # standardize 
+    X_standardize = scaler.transform(X)
+
+    # create torches
+    num_train_samples = len(X_standardize) // 48
+    X_timeseries_tensor = torch.tensor(
+        X_standardize[:num_train_samples * 48].reshape(num_train_samples, 48, 1),
+        dtype=torch.float32
+    )
+
+    # Drop timestamp and convert to numpy
+    train_attrs = attributes_pandas.drop(columns=["timestamp"]).values
+    X_attributes_tensor = torch.tensor(
+        train_attrs[:num_train_samples * 48].reshape(num_train_samples, 48, -1),
+        dtype=torch.float32
+    )
+
+    # predict
+    y_pred = model.predict(X_timeseries_tensor, X_attributes_tensor)
+
+    return y_pred
+
+
+if __name__ == "__main__":
+
+
+    # create a class for time data manipulation
+    train_path = "../podatki/bicikelj_train.csv"
+
+    # prepare time series data
+    timeseries_class = PrepareTimeSeries(train_path)
+    timeseries_class.load_and_process()
+    X_pandas = timeseries_class.X
+    y_pandas = timeseries_class.y
+
+    # prepare attribute data
+    attributes_class = PrepareAttributres(train_path)
+    attributes_class.load_and_process()
+    attributes_pandas = attributes_class.processed_data
+    attributes_list = attributes_class.attributes
+
+    # prepare whole data
+    preparedata_class = PrepareData(attributes_pandas, X_pandas)
+    preparedata_class.adjust_attributes()
+    attributes_adjusted = preparedata_class.attributes
+    #print(attributes_adjusted)
+
+    stations = preparedata_class.get_station_names()
+    predictions = {}
+
+    for idx, station in enumerate(stations):
+        print(f"\n*********predicting for station number {idx+1}: {station}*********")
+
+        # standardize data
+        time_series_station = X_pandas[[station]].values
+        #print(time_series_station)
+
+        scaler = StandardScaler()
+        scaler.fit(time_series_station)
+        scaler_mean = scaler.mean_[0] 
+        scaler_std = scaler.scale_[0] 
+
+        time_series_standardize = scaler.transform(time_series_station)
+        y = y_pandas[station].values
+
+        #print(f"timeseries shape: {time_series_standardize.shape}")
+        #print(f"attributes shape: {attributes_adjusted.shape}")
+        #print(f"y shape: {y.shape}")
+
+
+
+        # create torches
+        num_train_samples = len(time_series_standardize) // 48
+        #print(f"num train samlpes: {num_train_samples}")
+
+        X_timeseries_tensor = torch.tensor(
+            time_series_standardize[:num_train_samples * 48].reshape(num_train_samples, 48, 1),
+            dtype=torch.float32
+        )
+
+        # Drop timestamp and convert to numpy
+        train_attrs = attributes_adjusted.drop(columns=["timestamp"]).values
+
+        X_attributes_tensor = torch.tensor(
+            train_attrs[:num_train_samples * 48].reshape(num_train_samples, 48, -1),
+            dtype=torch.float32
+        )
+
+        y_tensor = torch.tensor(
+            y[:num_train_samples * 4].reshape(num_train_samples, 4),
+            dtype=torch.float32
+        )
+
+        #print(f"attributes list: {attributes_list}")
+        #print(f"attributes length: {len(attributes_list)}")
+        #print(f"timeseries sensor shape: {X_timeseries_tensor.shape}")
+        #print(f"attributes sensor shape: {X_attributes_tensor.shape}")
+        #print(f"y sensor shape: {y_tensor.shape}")
+
+
+        # train the model
+        model = Model_Dual_Branch(scaler_mean=scaler_mean, scaler_std=scaler_std, attr_input_size=(len(attributes_list)))
+        model.fit(X_timeseries_tensor, X_attributes_tensor, y_tensor)
+
+        #print("HELLOOOOOOOOO")
+    
+        # actual test data
+        test_path = "../podatki/bicikelj_test.csv"
+        final_preds = final_prediction(test_path, station, model, scaler)
+        predictions[station] = final_preds.numpy().flatten()  
+    
+
+        #if idx > 1:
+        #    break
+
+
+
+    # putting together predictions
+    final_predictions = pd.DataFrame(predictions)
+
+    # Add timestamps
+    test_data = pd.read_csv(test_path)
+    timestamps = []
+    for idx in range(0, len(test_data), 52):
+        y_slice = test_data.iloc[(idx + 48):(idx + 48 + 4)]
+        timestamps.extend(y_slice["timestamp"].values)
+
+    final_predictions.insert(0, "timestamp", timestamps)
+
+    # Save
+    final_predictions.to_csv("bicikelj_predictions_time_series_lstm_dual_branch.csv", index=False)
+    print("Final submission saved.")
